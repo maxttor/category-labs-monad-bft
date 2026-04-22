@@ -24,7 +24,8 @@ use std::{
 
 use alloy_primitives::U256;
 use alloy_rlp::{
-    Decodable, Encodable, RlpDecodable, RlpDecodableWrapper, RlpEncodable, RlpEncodableWrapper,
+    bytes::Bytes, Decodable, Encodable, RlpDecodable, RlpDecodableWrapper, RlpEncodable,
+    RlpEncodableWrapper,
 };
 use monad_crypto::certificate_signature::PubKey;
 pub use monad_crypto::hasher::Hash;
@@ -37,6 +38,7 @@ pub const GENESIS_ROUND: Round = Round(0);
 
 pub const ETHERNET_MTU: u16 = 1500;
 pub const DEFAULT_MTU: u16 = ETHERNET_MTU;
+pub const MAX_FORWARDED_TXS_PER_MESSAGE: usize = 5_000;
 
 const PROTOCOL_VERSION: u32 = 1;
 
@@ -986,6 +988,103 @@ impl<T, const N: usize> IntoIterator for LimitedVec<T, N> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ForwardedTxList(LimitedVec<Bytes, MAX_FORWARDED_TXS_PER_MESSAGE>);
+
+impl ForwardedTxList {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, Bytes> {
+        self.0.iter()
+    }
+
+    pub fn try_push(&mut self, value: Bytes) -> Result<(), Bytes> {
+        self.0.try_push(value).map_err(|err| err.rejected)
+    }
+
+    pub fn into_inner(self) -> Vec<Bytes> {
+        self.0.into_inner()
+    }
+}
+
+impl TryFrom<Vec<Bytes>> for ForwardedTxList {
+    type Error = Vec<Bytes>;
+
+    fn try_from(vec: Vec<Bytes>) -> Result<Self, Self::Error> {
+        if vec.len() > MAX_FORWARDED_TXS_PER_MESSAGE {
+            return Err(vec);
+        }
+        Ok(Self(LimitedVec(vec)))
+    }
+}
+
+impl Encodable for ForwardedTxList {
+    fn length(&self) -> usize {
+        self.0.length()
+    }
+
+    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
+        self.0.encode(out);
+    }
+}
+
+impl Decodable for ForwardedTxList {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        LimitedVec::decode(buf).map(Self)
+    }
+}
+
+impl Serialize for ForwardedTxList {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            let txs = self.iter().map(hex::encode).collect::<Vec<_>>();
+            return Serialize::serialize(&txs, serializer);
+        }
+        Serialize::serialize(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ForwardedTxList {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let txs = if deserializer.is_human_readable() {
+            <Vec<String> as Deserialize>::deserialize(deserializer)?
+                .into_iter()
+                .map(|tx| hex::decode(tx).map(Bytes::from))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(<D::Error as serde::de::Error>::custom)?
+        } else {
+            <Vec<Bytes> as Deserialize>::deserialize(deserializer)?
+        };
+
+        txs.try_into()
+            .map_err(|_| <D::Error as serde::de::Error>::custom("list exceeds maximum length"))
+    }
+}
+
+impl<'a> IntoIterator for &'a ForwardedTxList {
+    type Item = &'a Bytes;
+    type IntoIter = std::slice::Iter<'a, Bytes>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl IntoIterator for ForwardedTxList {
+    type Item = Bytes;
+    type IntoIter = std::vec::IntoIter<Bytes>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 /// A `u64` that enforces a maximum value during construction and RLP deserialization.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BoundedU64<const MAX: u64>(u64);
@@ -1180,6 +1279,29 @@ mod test {
         let err = v.try_push(7).unwrap_err();
         assert_eq!(err.rejected, 7);
         assert_eq!(err.capacity, 0);
+    }
+
+    #[test]
+    fn test_forwarded_tx_list_try_from_rejects_overflow() {
+        let result: Result<ForwardedTxList, _> =
+            vec![Bytes::from_static(&[0]); MAX_FORWARDED_TXS_PER_MESSAGE + 1].try_into();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_forwarded_tx_list_json_uses_hex_strings() {
+        let txs: ForwardedTxList = vec![Bytes::from_static(&[0x12, 0x34]), Bytes::new()]
+            .try_into()
+            .unwrap();
+
+        let json = serde_json::to_string(&txs).unwrap();
+        assert_eq!(json, "[\"1234\",\"\"]");
+
+        let decoded: ForwardedTxList = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            decoded.into_inner(),
+            vec![Bytes::from_static(&[0x12, 0x34]), Bytes::new()]
+        );
     }
 
     #[test]
