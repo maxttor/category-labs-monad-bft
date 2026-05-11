@@ -8,6 +8,9 @@ edition = "2021"
 [lib]
 bench = false
 
+[features]
+raptorcast = ["dep:monad-raptorcast"]
+
 [dependencies]
 monad-blocksync = { workspace = true }
 monad-chain-config = { workspace = true }
@@ -17,6 +20,7 @@ monad-crypto = { workspace = true }
 monad-executor = { workspace = true }
 monad-executor-glue = { workspace = true }
 monad-multi-sig = { workspace = true }
+monad-raptorcast = { workspace = true, optional = true }
 monad-router-scheduler = { workspace = true }
 monad-state = { workspace = true }
 monad-state-backend = { workspace = true }
